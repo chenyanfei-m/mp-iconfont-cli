@@ -4,22 +4,23 @@ const puppeteer = require('puppeteer');
 const ora = require('ora');
 const inquirer = require('inquirer');
 const axios = require('axios');
-const csstree = require('css-tree');
-const mkdirp = require('mkdirp');
+const cookie = require('cookie')
+const AdmZip = require('adm-zip')
+const minimatch = require('minimatch')
 
 const CWD = process.cwd();
 const spinner = ora();
 const Configstore = require('configstore');
 const config = new Configstore(CWD);
+const userConfigFilePath = path.resolve(process.cwd(), './.iconfontrc.json')
 
 const GITHUB_ACCOUNT = 'githubAccount';
 const GITHUB_PASSWORD = 'githubPassword';
-const ICON_PROJECT_IDX = 'iconProjectIdx';
-const WXSS_SAVE_PATH = 'wxssSavePath';
-const WXSS_DEFAULT_RELATIVE_PATH = 'src/styles/iconfont.wxss';
+const ICON_PROJECT_ID = 'iconProjectId';
 
 async function updateIconfontMain() {
   spinner.start('正在初始化');
+  const userConfig = await getUserConfig();
   const browser = await puppeteer.launch();
   const page = await browser.newPage();
   spinner.succeed('初始化完毕');
@@ -28,9 +29,9 @@ async function updateIconfontMain() {
     await loginOfGithub(page);
     await authOfGithub(page);
     await gotoIconfontMyProjects(page);
-    await getMyProjectList(page);
-    const url = await getProjectUrl(page);
-    await saveWxssFile(url);
+    await settingAxios(page);
+    await updateSelectedProjectId();
+    await downloadProjectSource(userConfig);
   } catch (e) {
     spinner.stop();
     throw e;
@@ -40,13 +41,99 @@ async function updateIconfontMain() {
   }
 }
 
+const getUserConfig = async () => {
+  const spinner = ora('解析配置...').start()
+  let userConfig
+  try {
+    userConfig = JSON.parse(fs.readFileSync(
+      userConfigFilePath,
+      { encoding: 'utf-8' }
+    ))
+    spinner.clear()
+  } catch (err) {
+    spinner.warn('解析 .iconfontrc.json 失败，将使用默认配置')
+    userConfig = {}
+  }
+  const defaultConfig = {
+    output: './',
+    includes: ['**/*'],
+  }
+  const finalConfig = {
+    ...defaultConfig,
+    ...userConfig,
+  }
+
+  return finalConfig
+}
+
+async function getCookies(page) {
+  const { cookies } = await page._client.send('Network.getAllCookies')
+  const iconfontCookies = cookies.filter(ele => ele.domain.match(/\.iconfont\.cn$/))
+
+  return iconfontCookies
+}
+
+async function getSerializedCookies(cookies) {
+  const result = cookies.reduce((acc, ele) => {
+    return `${acc}${cookie.serialize(ele.name, ele.value)}; `
+  }, '')
+  return result
+}
+
+async function settingAxios(page) {
+  const cookies = await getCookies(page)
+  const ctoken = cookies.find(ele => ele.name === 'ctoken').value
+  const defaultParams = {
+    ctoken,
+  }
+
+  const cookie = await getSerializedCookies(cookies)
+  const defaultHeaders = {
+    cookie,
+    'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36'
+  }
+
+  axios.defaults.baseURL = 'https://www.iconfont.cn'
+  axios.defaults.params = defaultParams
+  axios.defaults.headers = defaultHeaders
+  axios.interceptors.request.use(function (config) {
+    const finalConfig = {
+      ...config,
+      params: {
+        ...config.params,
+        t: +new Date()
+      }
+    }
+    return finalConfig;
+  }, function (error) {
+    return Promise.reject(error);
+  });
+}
+
+
+async function getProjects() {
+  const projectsPath = '/api/user/myprojects.json'
+  const { data: { data: { corpProjects } } } = await axios.get(projectsPath)
+  return corpProjects
+}
+
+async function downloadZipFile(projectId) {
+  const downloadPath = '/api/project/download.zip'
+  const { data } = await axios.get(downloadPath, {
+    params: { pid: projectId },
+    responseType: 'arraybuffer'
+  })
+  return data
+}
+
+
 async function gotoIconfontHome(page) {
   spinner.start('访问 iconfont 主页');
   await page.goto('https://www.iconfont.cn/', { waitUntil: 'networkidle0' });
   const loginEle = await page.$('.signin');
   await loginEle.click();
   const loginGithubEle = await page.waitForSelector(
-    'a[href="/api/login/github"]',
+    'a[href^="/api/login/github"]',
     { visible: true }
   );
   spinner.succeed('iconfont 主页加载完毕');
@@ -119,135 +206,49 @@ async function gotoIconfontMyProjects(page) {
   );
 }
 
-async function getMyProjectList(page) {
-  const list = await page.waitForSelector(
-    '.nav-container:nth-child(2) > .nav-lists',
-    { visible: true }
-  );
-  const projectList = await list.$$eval('.nav-item', nodes => {
-    return nodes.map(n => {
-      /changeProject\((\d+)\)/.test(n.getAttribute('mx-click'));
-      return {
-        id: RegExp.$1,
-        name: n.children[0].innerHTML
-      };
-    });
-  });
-  spinner.succeed('我的项目列表加载完毕');
+async function updateSelectedProjectId() {
+  const projects = await getProjects()
 
-  let iconProjectIdx = config.get(ICON_PROJECT_IDX);
-  if (iconProjectIdx == null || iconProjectIdx < 0) {
-    const iconProjectInput = await inquirer.prompt({
-      type: 'rawlist',
-      name: 'iconProject',
-      message: '请选择 iconfont 项目：',
-      choices: projectList.map(p => p.name)
-    });
-    iconProjectIdx = projectList.findIndex(
-      p => p.name === iconProjectInput.iconProject
-    );
-    config.set(ICON_PROJECT_IDX, iconProjectIdx);
-  }
+  const selectedProjectId = config.get(ICON_PROJECT_ID);
+  const iconProjectIsExist = projects.some(ele => ele.id === selectedProjectId)
+
+  if (iconProjectIsExist) return
+
+  const message = selectedProjectId && !iconProjectIsExist
+    ? '项目不存在，请重新选择 iconfont 项目：'
+    : '请选择 iconfont 项目：'
+
+  const iconProjectInput = await inquirer.prompt({
+    type: 'list',
+    name: 'projectId',
+    message,
+    choices: projects.map(ele => ({
+      name: ele.name,
+      value: ele.id,
+      short: `已选择 ${ele.name}`
+    }))
+  });
+
+  config.set(ICON_PROJECT_ID, iconProjectInput.projectId);
 }
 
-async function getProjectUrl(page) {
-  const iconProjectIdx = config.get(ICON_PROJECT_IDX);
-  const link = await page.waitForSelector(
-    `.nav-container:nth-child(2) > .nav-lists >.nav-item:nth-child(` +
-      `${iconProjectIdx + 1})`,
-    { visible: true }
-  );
-  const projectName = await link.$eval('span', node => {
-    return node.innerHTML;
-  });
-  spinner.info(`选择的项目是：${projectName}`);
-  spinner.start('正在获取 CSS 地址');
-  await link.click();
+async function downloadProjectSource({ output, includes }) {
+  spinner.start('正在下载文件...')
 
-  // 这里有个难点，怎么等待 ajax 结束最简单？
-  await page.waitFor(1000);
+  const selectedProjectId = config.get(ICON_PROJECT_ID);
+  const finalOutputPath = path.resolve(CWD, output)
+  const fileBuffer = await downloadZipFile(selectedProjectId)
 
-  await page.waitForSelector('.type-select.clearfix', { visible: true });
-  const fontClassLink = await page.waitForSelector(
-    '.type-select.clearfix > li:nth-child(2)'
-  );
-  await fontClassLink.click();
-  const managerBar = await page.waitForSelector('.project-manage-bar');
-  const needClickOnlineBtn = await managerBar.$eval('.bar-link', node => {
-    return !node.classList.contains('show');
-  });
-  if (needClickOnlineBtn) {
-    const onlineBtn = await page.$('.project-manage-bar > .bar-link');
-    await onlineBtn.click();
-  }
-
-  await page.waitForSelector('.project-code-top', { visible: true });
-  const needRefresh = await managerBar.$$eval('.cover-btn', nodes => {
-    return nodes.length > 1;
-  });
-  if (needRefresh) {
-    const refreshBtn = await page.waitForSelector(
-      '.project-code-top > .cover-btn:nth-child(2)'
-    );
-    await refreshBtn.click();
-
-    // 等待遮罩结束
-    let mask = await page.waitForSelector('.mp-e2e-body');
-    while (mask != null) {
-      await page.waitFor(300);
-      try {
-        mask = await page.waitForSelector('.mp-e2e-body', 50);
-      } catch {
-        mask = null;
-      }
+  const zip = new AdmZip(fileBuffer);
+  const zipEntries = zip.getEntries();
+  zipEntries.forEach(({ isDirectory, entryName }) => {
+    const isInclude = includes ? includes.some(ele => minimatch(entryName, ele)) : true
+    if (!isDirectory && isInclude) {
+      zip.extractEntryTo(entryName, finalOutputPath, false, true);
     }
-  }
+  })
 
-  await page.waitForSelector('.project-code-top', { visible: true });
-  const codeContainers = await page.$$(
-    '.project-code-top ~ .project-code-container'
-  );
-  let code = await codeContainers[1].$eval('pre', node => {
-    return node.innerHTML;
-  });
-  code = `https:${code}`;
-  spinner.succeed('CSS 地址获取完毕');
-  return code;
-}
-
-async function saveWxssFile(url) {
-  spinner.start('正在下载 CSS 文件');
-  const res = await axios.get(url);
-  spinner.succeed('CSS 文件下载完毕');
-  let savePath = config.get(WXSS_SAVE_PATH);
-  if (savePath == null || savePath === '') {
-    const savePathInput = await inquirer.prompt({
-      type: 'input',
-      name: 'savePath',
-      message: '请输入 WXSS 文件保存路径：',
-      default: WXSS_DEFAULT_RELATIVE_PATH
-    });
-    if (savePathInput.savePath === '') {
-      savePathInput.savePath = WXSS_DEFAULT_RELATIVE_PATH;
-    }
-    savePath = path.resolve(CWD, savePathInput.savePath);
-    config.set(WXSS_SAVE_PATH, savePath);
-  }
-
-  spinner.start('正在生成 WXSS 文件');
-  let ast = csstree.parse(res.data);
-  ast = csstree.toPlainObject(ast);
-  const firstBlock = ast.children[0].block;
-  firstBlock.children.splice(1, 1);
-  const srcDeclarationContents = firstBlock.children[1].value.children;
-  srcDeclarationContents.splice(0, 4);
-  srcDeclarationContents.splice(3, srcDeclarationContents.length - 3);
-
-  const content = csstree.generate(ast);
-  await mkdirp(path.dirname(savePath));
-  fs.writeFileSync(savePath, content);
-  spinner.succeed('WXSS 文件保存完毕');
-  spinner.info(`WXSS 文件路径是：${savePath}`);
+  spinner.succeed('下载完成')
 }
 
 function clearSettings() {

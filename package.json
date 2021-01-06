@@ -6,6 +6,7 @@
   "bin": {
     "iconfont-update": "./bin/cli.js"
   },
+  "main": "./bin/cli.js",
   "scripts": {
     "run": "node ./bin/cli.js --trace"
   },
@@ -28,19 +29,20 @@
   ],
   "homepage": "https://github.com/deepfunc/mp-iconfont-cli#readme",
   "dependencies": {
-    "axios": "^0.19.2",
+    "adm-zip": "^0.5.1",
+    "axios": "^0.21.1",
     "commander": "^5.0.0",
     "configstore": "^5.0.1",
-    "css-tree": "^1.0.0-alpha.39",
+    "cookie": "^0.4.1",
+    "dayjs": "^1.10.2",
     "inquirer": "^7.1.0",
-    "mkdirp": "^1.0.4",
+    "minimatch": "^3.0.4",
     "ora": "^4.0.3",
     "puppeteer": "^2.1.1"
   },
   "devDependencies": {
     "@types/configstore": "^4.0.0",
     "@types/inquirer": "^6.5.0",
-    "@types/mkdirp": "^1.0.0",
     "@types/node": "^13.9.5",
     "@types/puppeteer": "^2.0.1",
     "prettier": "^2.0.4"
